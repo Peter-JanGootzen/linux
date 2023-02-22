@@ -62,6 +62,7 @@ struct virtio_fs {
 	unsigned int nvqs;               /* number of virtqueues */
 	unsigned int num_request_queues; /* number of request queues */
 	struct dax_device *dax_dev;
+	unsigned int *mq_mapping; /* index = cpu id, value = request vq id */
 
 	/* DAX memory window where file contents are mapped */
 	void *window_kaddr;
@@ -649,6 +650,58 @@ static void virtio_fs_requests_done_work(struct work_struct *work)
 	}
 }
 
+static void virtio_fs_clean_affinity(struct virtio_fs *fs) {
+	int i;
+	for (i = 0; i < fs->num_request_queues; i++) {
+		virtqueue_set_affinity(fs->vqs[i+VQ_REQUEST].vq, NULL);
+	}
+}
+
+static int virtio_fs_set_affinity(struct virtio_fs *fs)
+{
+	cpumask_var_t mask;
+	int stragglers;
+	int group_size;
+	int i, j, cpu;
+	int num_cpu;
+	int stride;
+
+	num_cpu = num_online_cpus();
+	fs->mq_mapping = kzalloc(num_cpu * sizeof(*fs->mq_mapping), GFP_KERNEL);
+	if (!fs->mq_mapping)
+		return -ENOMEM;
+
+	if (!zalloc_cpumask_var(&mask, GFP_KERNEL)) {
+		virtio_fs_clean_affinity(fs);
+		return -ENOMEM;
+	}
+
+	stride = max_t(int, num_cpu / fs->num_request_queues, 1);
+	stragglers = num_cpu >= fs->num_request_queues ?
+			num_cpu % fs->num_request_queues :
+			0;
+	/* stride * num_request_queues + straggles = num_cpu */
+	cpu = cpumask_first(cpu_online_mask);
+
+	/* hiprio is left default mapped */
+	for (i = 0; i < fs->num_request_queues; i++) {
+		group_size = stride + (i < stragglers ? 1 : 0);
+
+		for (j = 0; j < group_size; j++) {
+			cpumask_set_cpu(cpu, mask);
+			fs->mq_mapping[cpu] = i;
+			cpu = cpumask_next_wrap(cpu, cpu_online_mask,
+						nr_cpu_ids, false);
+		}
+		virtqueue_set_affinity(fs->vqs[i+VQ_REQUEST].vq, mask);
+		cpumask_clear(mask);
+	}
+
+	free_cpumask_var(mask);
+
+	return 0;
+}
+
 /* Virtqueue interrupt handler */
 static void virtio_fs_vq_done(struct virtqueue *vq)
 {
@@ -741,8 +794,9 @@ out:
 }
 
 /* Free virtqueues (device must already be reset) */
-static void virtio_fs_cleanup_vqs(struct virtio_device *vdev)
+static void virtio_fs_cleanup_vqs(struct virtio_device *vdev, struct virtio_fs *fs)
 {
+	virtio_fs_clean_affinity(fs);
 	vdev->config->del_vqs(vdev);
 }
 
@@ -875,7 +929,9 @@ static int virtio_fs_probe(struct virtio_device *vdev)
 	if (ret < 0)
 		goto out;
 
-	/* TODO vq affinity */
+	ret = virtio_fs_set_affinity(fs);
+	if (ret < 0)
+		goto out_vqs;
 
 	ret = virtio_fs_setup_dax(vdev, fs);
 	if (ret < 0)
@@ -894,7 +950,7 @@ static int virtio_fs_probe(struct virtio_device *vdev)
 
 out_vqs:
 	virtio_reset_device(vdev);
-	virtio_fs_cleanup_vqs(vdev);
+	virtio_fs_cleanup_vqs(vdev, fs);
 	kfree(fs->vqs);
 
 out:
@@ -926,7 +982,7 @@ static void virtio_fs_remove(struct virtio_device *vdev)
 	virtio_fs_stop_all_queues(fs);
 	virtio_fs_drain_all_queues_locked(fs);
 	virtio_reset_device(vdev);
-	virtio_fs_cleanup_vqs(vdev);
+	virtio_fs_cleanup_vqs(vdev, fs);
 
 	vdev->priv = NULL;
 	/* Put device reference on virtio_fs object */
@@ -1223,7 +1279,8 @@ out:
 static void virtio_fs_wake_pending_and_unlock(struct fuse_iqueue *fiq)
 __releases(fiq->lock)
 {
-	unsigned int queue_id = VQ_REQUEST; /* TODO multiqueue */
+	int cpu_id;
+	unsigned int queue_id;
 	struct virtio_fs *fs;
 	struct fuse_req *req;
 	struct virtio_fs_vq *fsvq;
@@ -1237,14 +1294,19 @@ __releases(fiq->lock)
 	spin_unlock(&fiq->lock);
 
 	fs = fiq->priv;
+	cpu_id = get_cpu();
+	queue_id = VQ_REQUEST + fs->mq_mapping[cpu_id];
 
-	pr_debug("%s: opcode %u unique %#llx nodeid %#llx in.len %u out.len %u\n",
-		  __func__, req->in.h.opcode, req->in.h.unique,
+	pr_debug("%s: opcode %u unique %#llx nodeid %#llx in.len %u out.len %u "
+		 "cpu_id %d queue_id %u\n",
+		 __func__, req->in.h.opcode, req->in.h.unique,
 		 req->in.h.nodeid, req->in.h.len,
-		 fuse_len_args(req->args->out_numargs, req->args->out_args));
+		 fuse_len_args(req->args->out_numargs, req->args->out_args),
+		 cpu_id, queue_id);
 
 	fsvq = &fs->vqs[queue_id];
 	ret = virtio_fs_enqueue_req(fsvq, req, false);
+	put_cpu();
 	if (ret < 0) {
 		if (ret == -ENOMEM || ret == -ENOSPC) {
 			/*
