@@ -350,12 +350,45 @@ static void virtio_fs_hiprio_done_work(struct work_struct *work)
 	spin_unlock(&fsvq->lock);
 }
 
+static int virtio_fs_request_dispatch_queued(struct virtio_fs_vq *fsvq)
+{
+	struct fuse_req *req;
+	int ret;
+
+	spin_lock(&fsvq->lock);
+	req = list_first_entry_or_null(&fsvq->queued_reqs, struct fuse_req,
+				       list);
+	if (!req) {
+		spin_unlock(&fsvq->lock);
+		return -ENOENT;
+	}
+	list_del_init(&req->list);
+	spin_unlock(&fsvq->lock);
+
+	ret = virtio_fs_enqueue_req(fsvq, req, true);
+	if (ret < 0) {
+		if (ret == -ENOMEM || ret == -ENOSPC) {
+			spin_lock(&fsvq->lock);
+			list_add(&req->list, &fsvq->queued_reqs);
+			spin_unlock(&fsvq->lock);
+			return ret;
+		}
+		req->out.h.error = ret;
+		spin_lock(&fsvq->lock);
+		dec_in_flight_req(fsvq);
+		spin_unlock(&fsvq->lock);
+		pr_err("virtio-fs: virtio_fs_enqueue_req() failed %d\n", ret);
+		fuse_request_end(req);
+	}
+
+	return 0;
+}
+
 static void virtio_fs_request_dispatch_work(struct work_struct *work)
 {
 	struct fuse_req *req;
 	struct virtio_fs_vq *fsvq = container_of(work, struct virtio_fs_vq,
 						 dispatch_work.work);
-	int ret;
 
 	pr_debug("virtio-fs: worker %s called.\n", __func__);
 	while (1) {
@@ -370,38 +403,6 @@ static void virtio_fs_request_dispatch_work(struct work_struct *work)
 		list_del_init(&req->list);
 		spin_unlock(&fsvq->lock);
 		fuse_request_end(req);
-	}
-
-	/* Dispatch pending requests */
-	while (1) {
-		spin_lock(&fsvq->lock);
-		req = list_first_entry_or_null(&fsvq->queued_reqs,
-					       struct fuse_req, list);
-		if (!req) {
-			spin_unlock(&fsvq->lock);
-			return;
-		}
-		list_del_init(&req->list);
-		spin_unlock(&fsvq->lock);
-
-		ret = virtio_fs_enqueue_req(fsvq, req, true);
-		if (ret < 0) {
-			if (ret == -ENOMEM || ret == -ENOSPC) {
-				spin_lock(&fsvq->lock);
-				list_add_tail(&req->list, &fsvq->queued_reqs);
-				schedule_delayed_work(&fsvq->dispatch_work,
-						      msecs_to_jiffies(1));
-				spin_unlock(&fsvq->lock);
-				return;
-			}
-			req->out.h.error = ret;
-			spin_lock(&fsvq->lock);
-			dec_in_flight_req(fsvq);
-			spin_unlock(&fsvq->lock);
-			pr_err("virtio-fs: virtio_fs_enqueue_req() failed %d\n",
-			       ret);
-			fuse_request_end(req);
-		}
 	}
 }
 
@@ -437,8 +438,6 @@ static int send_forget_request(struct virtio_fs_vq *fsvq,
 			pr_debug("virtio-fs: Could not queue FORGET: err=%d. Will try later\n",
 				 ret);
 			list_add_tail(&forget->list, &fsvq->queued_reqs);
-			schedule_delayed_work(&fsvq->dispatch_work,
-					      msecs_to_jiffies(1));
 			if (!in_flight)
 				inc_in_flight_req(fsvq);
 			/* Queue is full */
@@ -648,6 +647,8 @@ static void virtio_fs_requests_done_work(struct work_struct *work)
 			virtio_fs_request_complete(req, fsvq);
 		}
 	}
+
+	while (virtio_fs_request_dispatch_queued(fsvq) == 0) {}
 }
 
 static void virtio_fs_clean_affinity(struct virtio_fs *fs) {
@@ -1316,8 +1317,6 @@ __releases(fiq->lock)
 			spin_lock(&fsvq->lock);
 			list_add_tail(&req->list, &fsvq->queued_reqs);
 			inc_in_flight_req(fsvq);
-			schedule_delayed_work(&fsvq->dispatch_work,
-						msecs_to_jiffies(1));
 			spin_unlock(&fsvq->lock);
 			return;
 		}
